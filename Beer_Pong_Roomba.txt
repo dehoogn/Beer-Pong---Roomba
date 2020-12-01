@@ -1,0 +1,387 @@
+//  Title: Beermba
+//  Version: 1.0
+//  Author: Neil deHoog
+//  Date: May 25, 2019
+//
+//  Description: 
+//      A 3d printed beer pong Roomba. Contains 5 ultrasonic 
+//      sensors to prevent falling off of the table. It will randomly 
+//      wander about the table in auto or can be driven via phone in manual.
+//
+//  Hardware:
+//      HC-SR04 Ultrasonic Sensor x 5
+//      L298N Motor Driver x 1
+//      HC-05 Bluetooth Module x 1
+//      ATmega328p onboard an Arduino Nano x1
+
+// Libraries
+#include <SoftwareSerial.h>
+
+// Standard Arduino Nano Pin Defines
+#define RX 0      // Used by USB COMM
+#define TX 1      // Used by USB COMM
+#define D2 2      // Interrupt
+#define D3 3      // PWM, Interrupt
+#define D4 4
+#define D5 5      // PWM
+#define D6 6      // PWM
+#define D7 7
+#define D8 8
+#define D9 9      // PWM
+#define D10 10    // PWM
+#define D11 11    // PWM
+#define D12 12
+#define D13 13    // Onboard LED
+#define A0 14
+#define A1 15
+#define A2 16
+#define A3 17
+#define A4 18
+#define A5 19
+#define A6 20     // Analog input only
+#define A7 21     // Analog input only
+
+// Define ultrasonic sensor pins
+#define S0_TRIG A0
+#define S0_ECHO A1
+#define S1_TRIG A2
+#define S1_ECHO A3
+#define S2_TRIG A4
+#define S2_ECHO A5
+#define S3_TRIG D2
+#define S3_ECHO D3
+#define S4_TRIG D4
+#define S4_ECHO D5
+
+// Define motor driver pins
+#define MOTOR_A1 D9   // Right motor forward
+#define MOTOR_A2 D6   // Right motor reverse
+#define MOTOR_B1 D10  // Left motor forward
+#define MOTOR_B2 D11  // Left motor reverse
+
+// Define bluetooth pins
+#define BT_TX D7
+#define BT_RX D8
+
+// Non-Pin Related Defines
+#define REPORT 0          // 0 = no report, 1 = report
+#define MAX_DIST 150      // Max distance to floor
+#define MIN_DIST 15       // Min distance to table
+#define FWD 200           // Amount of time to move forward in ms
+#define REV 175           // Amount of time to reverse in ms
+#define REV_SMALL 50      // Amount of time to reverse for faster stopping
+#define LEFT_SMALL 600    // Amount of time to turn left in ms
+#define LEFT_LRG 600      // Amount of time to turn left in ms
+#define RIGHT_SMALL 300   // Amount of time to turn right in ms
+#define RIGHT_LRG 600     // Amount of time to turn right in ms
+#define ONE_EIGHTY 900    // Amount of time to do a 180 in ms
+#define PWR_FWD 125       // Motor speed used for forward
+#define PWR_REV 125       // Motor speed used for reverse
+#define PWR_TURN 200      // Motor speed used for turning
+
+// Global Variables
+int dist[5] = {0, 0, 0, 0, 0};  // Ultrasonic distance determined
+int current_sonar = 0;          // Current ultrasonic sensor to be triggered
+int turn_tracking = 0;          // Tracks if the vehicle has moved forward or not
+unsigned long time_out = 32000; // Timeout duration for the ultrasonic echo in us
+unsigned long sonar_time = 0;   // Tracks how long it takes to read all ultrasonics
+
+//****************************************************************//
+// Initialization
+//****************************************************************//
+void setup(){
+  
+  // Enable Ultrasonic Pins
+  pinMode(S0_TRIG, OUTPUT);
+  pinMode(S0_ECHO, INPUT);
+  pinMode(S1_TRIG, OUTPUT);
+  pinMode(S1_ECHO, INPUT);
+  pinMode(S2_TRIG, OUTPUT);
+  pinMode(S2_ECHO, INPUT);
+  pinMode(S3_TRIG, OUTPUT);
+  pinMode(S3_ECHO, INPUT);
+  pinMode(S4_TRIG, OUTPUT);
+  pinMode(S4_ECHO, INPUT);
+
+  // Initialize trigger pins low
+  digitalWrite(S0_TRIG, LOW);
+  digitalWrite(S1_TRIG, LOW);
+  digitalWrite(S2_TRIG, LOW);
+  digitalWrite(S3_TRIG, LOW);
+  digitalWrite(S4_TRIG, LOW);
+
+  // Enable motor driver pins
+  pinMode(MOTOR_A1, OUTPUT);
+  pinMode(MOTOR_A2, OUTPUT);
+  pinMode(MOTOR_B1, OUTPUT);
+  pinMode(MOTOR_B2, OUTPUT);
+
+  // Initialize motor driver pins low
+  digitalWrite(MOTOR_A1, LOW);
+  digitalWrite(MOTOR_A2, LOW);
+  digitalWrite(MOTOR_B1, LOW);
+  digitalWrite(MOTOR_B2, LOW);
+
+  // Initialte serial communication if run report is enabled
+  if (REPORT == 1)
+    Serial.begin(115200);
+
+  randomSeed(analogRead(A6));
+  delay(15000);
+}
+
+//****************************************************************//
+// Main loop
+//****************************************************************//
+void loop() {
+
+  // Read all ultrasonic sensors sequentially
+  current_sonar = 0;
+  for (int i = 0; i < 5; i++){
+    sonar_read();
+    current_sonar++;
+  }
+
+  // Perform maneuvers based on ultrasonic feedback
+  maneuver();
+
+  // Run report if this option is enabled
+  if (REPORT == 1)
+    run_report();
+}
+
+//****************************************************************//
+// Perform maneuvers based on feedback from the ultrasonic sensors
+// Ultrasonic sensors are positioned 1-5 from left to right
+//****************************************************************//
+void maneuver(){
+
+  int checked = 0;
+  
+  // Stop if error in ultrasonic reading found
+  for (int i = 0; i < 5; i++){
+    if (dist[i] == -1){
+      checked = 1;
+      full_stop();
+    }
+  }
+
+  // If sensors from both sides are triggered, perform table corner maneuver
+  if ((dist[0] > MIN_DIST || dist[1] > MIN_DIST) && (dist[3] > MIN_DIST || dist[4] > MIN_DIST)){
+    checked = 1;
+    reverse_rnd();
+  }
+
+  // Sensor 3 above min distance
+  if (dist[2] > MIN_DIST && checked == 0){
+    checked = 1;
+    reverse_rnd();
+  }
+
+  // Sensor 1 above min distance
+  if (dist[0] > MIN_DIST && checked == 0){
+    checked = 1;
+    reverse(REV_SMALL);
+    if (dist[1] > MIN_DIST)
+      left(RIGHT_LRG);
+    else
+      left(RIGHT_SMALL);
+  }
+
+  // Sensor 2 above min distance
+  if (dist[1] > MIN_DIST && checked == 0){
+    checked = 1;
+    reverse(REV_SMALL);
+    left(RIGHT_LRG);
+  }
+
+  // Sensor 4 above min distance
+  if (dist[3] > MIN_DIST && checked == 0){
+    checked = 1;
+    reverse(REV_SMALL);
+    right(LEFT_LRG);
+  }
+
+  // Sensor 5 above min distance
+  if (dist[4] > MIN_DIST && checked == 0){
+    checked = 1;
+    reverse(REV_SMALL);
+    if (dist[3] > MIN_DIST)
+      right(LEFT_LRG);
+    else
+      right(LEFT_SMALL);
+  }
+
+  // Continue forward if all checks pass
+  if (checked == 0)
+    forward();
+}
+
+//****************************************************************//
+// Sets the vehicle in forward motion
+//****************************************************************//
+void forward(){
+  turn_tracking = 0;
+  analogWrite(MOTOR_A1, PWR_FWD);
+  analogWrite(MOTOR_A2, LOW);
+  analogWrite(MOTOR_B1, PWR_FWD);
+  analogWrite(MOTOR_B2, LOW);
+}
+
+//****************************************************************//
+// Stops the vehicle completely
+//****************************************************************//
+void full_stop(){
+  digitalWrite(MOTOR_A1, LOW);
+  digitalWrite(MOTOR_A2, LOW);
+  digitalWrite(MOTOR_B1, LOW);
+  digitalWrite(MOTOR_B2, LOW);
+}
+
+//****************************************************************//
+// Makes a small reverse movement and then randomly turns left or right
+//****************************************************************//
+void reverse_rnd(){
+  int rnd = 0;
+
+  if (turn_tracking == 0)
+    reverse(REV);
+  
+  rnd = random(4);
+  if (rnd == 0)
+    left(LEFT_LRG);
+  else if (rnd == 1)
+    right(RIGHT_LRG);
+  else if (rnd == 2)
+    left(ONE_EIGHTY);
+  else
+    right(ONE_EIGHTY);
+}
+
+//****************************************************************//
+// Quick reverse to assist stopping the vehicle
+//****************************************************************//
+void reverse(int amount){
+  analogWrite(MOTOR_A1, LOW);
+  analogWrite(MOTOR_A2, PWR_REV);
+  analogWrite(MOTOR_B1, LOW);
+  analogWrite(MOTOR_B2, PWR_REV);
+  delay(amount);
+}
+
+//****************************************************************//
+// Performs a left turn
+//****************************************************************//
+void left(int amount){
+  
+  if(turn_tracking == 0)
+    reverse(REV);
+    
+  analogWrite(MOTOR_A1, LOW);
+  analogWrite(MOTOR_A2, PWR_TURN);
+  analogWrite(MOTOR_B1, PWR_TURN);
+  analogWrite(MOTOR_B2, LOW);
+  delay(amount);
+  turn_tracking = 1;
+}
+
+//****************************************************************//
+// Performs a right turn
+//****************************************************************//
+void right(int amount){
+
+  if(turn_tracking == 0)
+    reverse(REV);
+    
+  analogWrite(MOTOR_A1, PWR_TURN);
+  analogWrite(MOTOR_A2, LOW);
+  analogWrite(MOTOR_B1, LOW);
+  analogWrite(MOTOR_B2, PWR_TURN);
+  delay(amount);
+  turn_tracking = 1;
+}
+
+//****************************************************************//
+// Reads all of the ultrasonic sensors sequentially
+//****************************************************************//
+void sonar_read(){
+  
+  unsigned long duration = 0;
+  sonar_time = millis();
+  
+  if (current_sonar == 0){
+    digitalWrite(S0_TRIG, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(S0_TRIG, LOW);
+    duration = pulseIn(S0_ECHO, HIGH, time_out);
+    if (duration == 0)
+      dist[current_sonar] = -1;
+    else
+      dist[current_sonar] = ((duration/2)/29);
+  }
+
+  if (current_sonar == 1){
+    digitalWrite(S1_TRIG, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(S1_TRIG, LOW);
+    duration = pulseIn(S1_ECHO, HIGH, time_out);
+    if (duration == 0)
+      dist[current_sonar] = -1;
+    else
+      dist[current_sonar] = ((duration/2)/29);
+  }
+  
+  if (current_sonar == 2){
+    digitalWrite(S2_TRIG, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(S2_TRIG, LOW);
+    duration = pulseIn(S2_ECHO, HIGH, time_out);
+    if (duration == 0)
+      dist[current_sonar] = -1;
+    else
+      dist[current_sonar] = ((duration/2)/29);
+  }
+
+  if (current_sonar == 3){
+    digitalWrite(S3_TRIG, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(S3_TRIG, LOW);
+    duration = pulseIn(S3_ECHO, HIGH, time_out);
+    if (duration == 0)
+      dist[current_sonar] = -1;
+    else
+      dist[current_sonar] = ((duration/2)/29);
+  }
+
+  if (current_sonar == 4){
+    digitalWrite(S4_TRIG, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(S4_TRIG, LOW);
+    duration = pulseIn(S4_ECHO, HIGH, time_out);
+    if (duration == 0)
+      dist[current_sonar] = -1;
+    else
+      dist[current_sonar] = ((duration/2)/29);
+  }
+
+  sonar_time = (millis()) - sonar_time;
+}
+
+//****************************************************************//
+// Runs a report to the serial interface if the option is enabled
+//****************************************************************//
+void run_report(){
+  
+  for (int i = 0; i < 5; i++){
+    Serial.print("Sensor ");
+    Serial.print(i+1);
+    Serial.print(": ");
+    Serial.print(dist[i]);
+    Serial.println("cm");
+  }
+  
+  Serial.print("Time Elapsed: ");
+  Serial.println(sonar_time);
+  Serial.println("");
+  //delay(1000);
+}
